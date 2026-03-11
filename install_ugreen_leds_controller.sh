@@ -824,7 +824,8 @@ else
     modprobe -a i2c-dev ledtrig-oneshot ledtrig-netdev || true
     # Load custom module using insmod with absolute path
     if [ -f "${PERSIST_DIR}/led-ugreen.ko" ]; then
-        if [ -d "/sys/module/led_ugreen" ]; then
+        MODULE_LOADED=$(lsmod | grep "led_ugreen" || true)
+        if [ -n "${MODULE_LOADED}" ]; then
             log "Module led-ugreen already loaded, skipping insmod"
         else
             insmod "${PERSIST_DIR}/led-ugreen.ko" || log "Warning: failed to load led-ugreen module"
