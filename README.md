@@ -160,6 +160,7 @@ Options:
   --dry-run             Show actions without making changes
   --yes                 Non-interactive mode (assume yes to all prompts)
   --force               Allow destructive actions
+  --no-update           Do not perform any code updates (for example, when running unattended in production)
 ```
 
 ### Uninstalling
