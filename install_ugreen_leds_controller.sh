@@ -2,6 +2,11 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# Pre-scan argv for --no-update before the GitHub fetch below, which runs before
+# the main argument-parsing loop.
+NO_UPDATE=false
+for _arg in "$@"; do [ "$_arg" = "--no-update" ] && NO_UPDATE=true && break; done
+
 # Cleanup function to remove the cloned repository (but NOT persistent directory)
 cleanup() {
     if [ "${NO_CLEANUP:-false}" = "true" ]; then
@@ -40,6 +45,8 @@ help() {
     echo "  --dry-run             Show actions without making changes"
     echo "  --yes                 Assume 'yes' to all prompts (non-interactive mode)"
     echo "  --force               Allow destructive actions (use with care)"
+    echo "  --no-update           Skip all network calls; use only locally cached files"
+    echo "                        Recommended for TrueNAS Init Scripts after initial install"
     echo
     echo "Examples:"
     echo "  # Interactive installation (prompts for persistent directory)"
@@ -52,7 +59,7 @@ help() {
     echo "  sudo bash install_ugreen_leds_controller.sh --pool-path tank/apps/ugreen"
     echo
     echo "  # Non-interactive (for TrueNAS Init Scripts)"
-    echo "  sudo bash install_ugreen_leds_controller.sh --yes"
+    echo "  sudo bash install_ugreen_leds_controller.sh --yes --no-update"
     echo
     echo "  # Uninstall (preview with --dry-run first)"
     echo "  sudo bash install_ugreen_leds_controller.sh --uninstall --dry-run"
@@ -143,6 +150,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --uninstall)
             UNINSTALL=true
+            shift
+            ;;
+        --no-update)
+            NO_UPDATE=true
             shift
             ;;
         *)
@@ -514,8 +525,10 @@ fi
 # Version Detection and Module URL Setup
 # ============================================================================
 
-# Fetch TrueNAS versions (only needed for install flow)
-fetch_truenas_versions
+# Fetch TrueNAS versions (only needed for install flow, and only if network allowed)
+if [ "$NO_UPDATE" = "false" ]; then
+    fetch_truenas_versions
+fi
 
 # Get TrueNAS version from system
 OS_VERSION=$(grep -oP '^[0-9]+\.[0-9]+(\.[0-9]+)?(\.[0-9]+)?' /etc/version || echo "")
@@ -532,21 +545,23 @@ find_codename_for_version() {
     
     log "Searching for codename matching version ${version}..." >&2
     
-    # Iterate through each codename directory from KMOD_DIRS
-    while IFS= read -r dir_name; do
-        if [ -z "$dir_name" ]; then
-            continue
-        fi
-        
-        # Use GitHub API to check if this codename directory contains our version
-        local check_api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${BUILD_PATH}/${dir_name}/${version}?ref=${REPO_BRANCH}"
-        
-        if curl --silent --fail "${check_api_url}" > /dev/null 2>&1; then
-            found_codename="$dir_name"
-            log "Found matching codename: ${dir_name}" >&2
-            break
-        fi
-    done <<< "$KMOD_DIRS"
+    # Iterate through each codename directory from KMOD_DIRS (skipped when --no-update)
+    if [ "$NO_UPDATE" = "false" ]; then
+        while IFS= read -r dir_name; do
+            if [ -z "$dir_name" ]; then
+                continue
+            fi
+
+            # Use GitHub API to check if this codename directory contains our version
+            local check_api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${BUILD_PATH}/${dir_name}/${version}?ref=${REPO_BRANCH}"
+
+            if curl --silent --fail "${check_api_url}" > /dev/null 2>&1; then
+                found_codename="$dir_name"
+                log "Found matching codename: ${dir_name}" >&2
+                break
+            fi
+        done <<< "$KMOD_DIRS"
+    fi
     
     # If not found via GitHub, try hardcoded fallback
     if [ -z "$found_codename" ]; then
@@ -560,7 +575,12 @@ find_codename_for_version() {
             "25.10") found_codename="TrueNAS-SCALE-Goldeye" ;;
             *)
                 echo "Unsupported TrueNAS SCALE version: ${version}." >&2
-                echo "No precompiled kernel module found in repository." >&2
+                if [ "$NO_UPDATE" = "true" ]; then
+                    echo "Version not in built-in codename map (repository was not checked due to --no-update)." >&2
+                    echo "Run once without --no-update to resolve the codename, then revert to --no-update." >&2
+                else
+                    echo "No precompiled kernel module found in repository." >&2
+                fi
                 echo "Please build the kernel module manually." >&2
                 exit 1
                 ;;
@@ -615,6 +635,11 @@ check_version_and_download() {
     fi
 
     if [ "${need_download}" = "true" ]; then
+        if [ "$NO_UPDATE" = "true" ]; then
+            echo "Kernel module missing or outdated, but --no-update prevents download." >&2
+            echo "Run without --no-update once to download it, then revert to --no-update." >&2
+            exit 1
+        fi
         log "Verifying kernel module availability..."
         # Use GitHub API to check if the file exists instead of curl --head on raw URLs
         local check_api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${BUILD_PATH}/${TRUENAS_NAME}/${TRUENAS_VERSION}/led-ugreen.ko?ref=${REPO_BRANCH}"
@@ -700,7 +725,9 @@ copy_installer_to_persistent_dir
 # Clone Repository
 # ============================================================================
 
-if [ ! -d "${CLONE_DIR}/.git" ]; then
+if [ "$NO_UPDATE" = "true" ]; then
+    log "Skipping repository clone/update (--no-update)"
+elif [ ! -d "${CLONE_DIR}/.git" ]; then
     log "Cloning ugreen_leds_controller repository..."
     if [ "${DRY_RUN}" = "true" ]; then
         log "DRY RUN: would clone repository to ${CLONE_DIR}"
@@ -797,7 +824,7 @@ else
     modprobe -a i2c-dev ledtrig-oneshot ledtrig-netdev || true
     # Load custom module using insmod with absolute path
     if [ -f "${PERSIST_DIR}/led-ugreen.ko" ]; then
-        if lsmod 2>/dev/null | grep -q "^led_ugreen"; then
+        if [ -d "/sys/module/led_ugreen" ]; then
             log "Module led-ugreen already loaded, skipping insmod"
         else
             insmod "${PERSIST_DIR}/led-ugreen.ko" || log "Warning: failed to load led-ugreen module"
@@ -1090,7 +1117,7 @@ echo "Persistent directory: ${PERSIST_DIR}"
 echo "Configuration: /etc/ugreen-leds.conf"
 echo ""
 echo "For TrueNAS Init/Shutdown Scripts, use:"
-echo "  ${PERSIST_DIR}/install_ugreen_leds_controller.sh --yes"
+echo "  ${PERSIST_DIR}/install_ugreen_leds_controller.sh --yes --no-update"
 echo ""
 echo "Reboot recommended to verify all services start correctly."
 echo ""
